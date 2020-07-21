@@ -1,2 +1,2 @@
-from models.ctronn_encoder import *
-from models.ctronn_decoder import *
+from .ctronn_encoder import *
+from .ctronn_decoder import *

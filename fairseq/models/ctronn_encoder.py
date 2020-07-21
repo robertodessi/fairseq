@@ -14,7 +14,7 @@ from torch import Tensor
 
 from einops import rearrange, reduce
 import numpy as np
-from models.ctronn_attention import *
+from .ctronn_attention import *
 
 
 class CtronnEncoderLayer(nn.Module):

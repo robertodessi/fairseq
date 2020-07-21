@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from fairseq import utils
 from fairseq.modules import LayerNorm
 from torch import Tensor
-from models.ctronn_attention import *
+from .ctronn_attention import *
 
 from einops import rearrange, reduce, asnumpy, parse_shape
 import numpy as np
