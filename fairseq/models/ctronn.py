@@ -1,0 +1,616 @@
+import math
+from typing import Any, Dict, List, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from fairseq import options, utils
+from fairseq.models import (
+    FairseqEncoder,
+    FairseqEncoderDecoderModel,
+    FairseqIncrementalDecoder,
+    register_model,
+    register_model_architecture,
+)
+from fairseq.models.fairseq_encoder import EncoderOut
+from fairseq.modules import (
+    LayerNorm,
+    PositionalEmbedding,
+    SinusoidalPositionalEmbedding,
+)
+from .ctronn_layer import (
+    CtronnDecoderLayer,
+    CtronnEncoderLayer
+)
+from .ctronn_attention import RelativeBias
+
+from torch import Tensor
+import scipy
+
+
+DEFAULT_MAX_SOURCE_POSITIONS = 1024
+DEFAULT_MAX_TARGET_POSITIONS = 1024
+
+
+@register_model("ctronn")
+class CtronnModel(FairseqEncoderDecoderModel):
+    def __init__(self, args, encoder, decoder):
+        super().__init__(encoder, decoder)
+        self.args = args
+        self.supports_align_args = True
+
+    @staticmethod
+    def add_args(parser):
+        # fmt: off
+        parser.add_argument('--dropout', type=float, metavar='D',
+                            help='dropout probability')
+        parser.add_argument('--attention-dropout', type=float, metavar='D',
+                            help='dropout probability for attention weights')
+        parser.add_argument('--activation-dropout', '--relu-dropout', type=float, metavar='D',
+                            help='dropout probability after activation in FFN.')
+        parser.add_argument('--encoder-embed-path', type=str, metavar='STR',
+                            help='path to pre-trained encoder embedding')
+        parser.add_argument('--encoder-embed-dim', type=int, metavar='N',
+                            help='encoder embedding dimension')
+        parser.add_argument('--encoder-ffn-embed-dim', type=int, metavar='N',
+                            help='encoder embedding dimension for FFN')
+        parser.add_argument('--encoder-layers', type=int, metavar='N',
+                            help='num encoder layers')
+        parser.add_argument('--encoder-attention-heads', type=str, metavar='N',
+                            help='num encoder attention heads')
+        parser.add_argument('--encoder-learned-pos', action='store_true',
+                            help='use learned positional embeddings in the encoder')
+        parser.add_argument('--decoder-embed-path', type=str, metavar='STR',
+                            help='path to pre-trained decoder embedding')
+        parser.add_argument('--decoder-embed-dim', type=int, metavar='N',
+                            help='decoder embedding dimension')
+        parser.add_argument('--decoder-ffn-embed-dim', type=int, metavar='N',
+                            help='decoder embedding dimension for FFN')
+        parser.add_argument('--decoder-layers', type=int, metavar='N',
+                            help='num decoder layers')
+        parser.add_argument('--decoder-attention-heads', type=int, metavar='N',
+                            help='num decoder attention heads')
+        parser.add_argument('--decoder-self-attention-heads', type=str, metavar='N',
+                            help='num decoder attention heads')
+        parser.add_argument('--decoder-learned-pos', action='store_true',
+                            help='use learned positional embeddings in the decoder')
+        parser.add_argument('--decoder-output-dim', type=int, metavar='N',
+                            help='decoder output dimension (extra linear layer '
+                                 'if different from decoder embed dim')
+        parser.add_argument('--share-decoder-input-output-embed', action='store_true',
+                            help='share decoder input and output embeddings')
+        parser.add_argument('--no-token-positional-embeddings', default=False, action='store_true',
+                            help='if set, disables positional embeddings (outside self attention)')
+        parser.add_argument('--layernorm-embedding', action='store_true',
+                            help='add layernorm to embedding')
+        parser.add_argument('--no-scale-embedding', action='store_true',
+                            help='if True, dont scale embeddings')
+
+        # ctronn specific
+        ## encoder
+        parser.add_argument('--cnn-attn-no-layer-norm', action='store_true')
+        parser.add_argument('--encoder-glu', action='store_true', default=False)
+        parser.add_argument('--encoder-attention-span', type=int, metavar='D', default=-1,
+                            help='')
+        parser.add_argument('--encoder-attention-type', default='plain', type=str)
+        ## decoder
+        parser.add_argument('--decoder-attention-type', default='plain', type=str)
+        parser.add_argument('--decoder-glu', action='store_true', default=False)
+        parser.add_argument('--decoder-attention-span', type=int, default=-1)
+        parser.add_argument('--decoder-cnn-attention-heads', type=int, default=-1)
+        # fmt: on
+
+    @classmethod
+    def build_model(cls, args, task):
+        # make sure all arguments are present in older models
+        base_architecture(args)
+
+        if getattr(args, "max_source_positions", None) is None:
+            args.max_source_positions = DEFAULT_MAX_SOURCE_POSITIONS
+        if getattr(args, "max_target_positions", None) is None:
+            args.max_target_positions = DEFAULT_MAX_TARGET_POSITIONS
+
+        src_dict, tgt_dict = task.source_dictionary, task.target_dictionary
+
+        encoder_embed_tokens = cls.build_embedding(
+            args, src_dict, args.encoder_embed_dim, args.encoder_embed_path
+        )
+        decoder_embed_tokens = cls.build_embedding(
+            args, tgt_dict, args.decoder_embed_dim, args.decoder_embed_path
+        )
+
+        encoder = cls.build_encoder(args, src_dict, encoder_embed_tokens)
+        decoder = cls.build_decoder(args, tgt_dict, decoder_embed_tokens)
+        return cls(args, encoder, decoder)
+
+    @classmethod
+    def build_embedding(cls, args, dictionary, embed_dim, path=None):
+        num_embeddings = len(dictionary)
+        padding_idx = dictionary.pad()
+
+        emb = Embedding(num_embeddings, embed_dim, padding_idx)
+        # if provided, load from preloaded dictionaries
+        if path:
+            embed_dict = utils.parse_embedding(path)
+            utils.load_embedding(embed_dict, dictionary, emb)
+        return emb
+
+    @classmethod
+    def build_encoder(cls, args, src_dict, embed_tokens):
+        return CtronnEncoder(args, src_dict, embed_tokens)
+
+    @classmethod
+    def build_decoder(cls, args, tgt_dict, embed_tokens):
+        return CtronnDecoder(
+            args,
+            tgt_dict,
+            embed_tokens
+        )
+
+    # TorchScript doesn't support optional arguments with variable length (**kwargs).
+    # Current workaround is to add union of all arguments in child classes.
+    def forward(
+        self,
+        src_tokens,
+        src_lengths,
+        prev_output_tokens,
+        return_all_hiddens: bool = True
+    ):
+        """
+        Run the forward pass for an encoder-decoder model.
+
+        Copied from the base class, but without ``**kwargs``,
+        which are not supported by TorchScript.
+        """
+
+        if self.args.left_pad_source:
+            prev_output_tokens = utils.convert_padding_direction(
+                prev_output_tokens,
+                padding_idx=self.decoder.dictionary.pad(),
+                left_to_right=True
+            )
+
+            src_tokens = utils.convert_padding_direction(
+                src_tokens,
+                padding_idx=self.encoder.dictionary.pad(),
+                left_to_right=True
+            )
+
+
+        encoder_out = self.encoder(
+            src_tokens, src_lengths=src_lengths, return_all_hiddens=return_all_hiddens
+        )
+        decoder_out = self.decoder(
+            prev_output_tokens,
+            encoder_out=encoder_out,
+            src_lengths=src_lengths,
+            return_all_hiddens=return_all_hiddens,
+        )
+        return decoder_out
+
+    # Since get_normalized_probs is in the Fairseq Model which is not scriptable,
+    # I rewrite the get_normalized_probs from Base Class to call the
+    # helper function in the Base Class.
+    @torch.jit.export
+    def get_normalized_probs(
+        self,
+        net_output: Tuple[Tensor, Optional[Dict[str, List[Optional[Tensor]]]]],
+        log_probs: bool,
+        sample: Optional[Dict[str, Tensor]] = None,
+    ):
+        """Get normalized probabilities (or log probs) from a net's output."""
+        return self.get_normalized_probs_scriptable(net_output, log_probs, sample)
+
+
+class CtronnEncoder(FairseqEncoder):
+    """
+    Transformer encoder consisting of *args.encoder_layers* layers. Each layer
+    is a :class:`TransformerEncoderLayer`.
+
+    Args:
+        args (argparse.Namespace): parsed command-line arguments
+        dictionary (~fairseq.data.Dictionary): encoding dictionary
+        embed_tokens (torch.nn.Embedding): input embedding
+    """
+
+    def __init__(self, args, dictionary, embed_tokens):
+        super().__init__(dictionary)
+        self.register_buffer("version", torch.Tensor([3]))
+
+        self.dropout = args.dropout
+
+        embed_dim = embed_tokens.embedding_dim
+        self.padding_idx = embed_tokens.padding_idx
+        self.max_source_positions = args.max_source_positions
+
+        self.embed_tokens = embed_tokens
+
+        self.embed_scale = 1.0 if args.no_scale_embedding else math.sqrt(embed_dim)
+
+        self.embed_positions = (
+            PositionalEmbedding(
+                args.max_source_positions,
+                embed_dim,
+                self.padding_idx,
+                learned=args.encoder_learned_pos,
+            )
+            if not args.no_token_positional_embeddings
+            else None
+        )
+
+        self.layers = nn.ModuleList([])
+
+        attn_types = args.encoder_attention_type.split(',')
+        if len(attn_types) == 1:
+            attn_types = attn_types * args.encoder_layers
+        n_heads = args.encoder_attention_heads.split(',')
+        if len(n_heads) == 1:
+            n_heads = n_heads * args.encoder_layers
+        n_heads = [int(n) for n in n_heads]
+
+        assert len(attn_types) == args.encoder_layers == len(n_heads)
+
+        self.layers.extend([
+            self.build_encoder_layer(args, attn_type=attn_types[i], n_heads=n_heads[i]) \
+                for i in range(args.encoder_layers)
+        ])
+
+        self.num_layers = len(self.layers)
+
+        self.layer_norm = None
+        if getattr(args, "layernorm_embedding", False):
+            self.layernorm_embedding = LayerNorm(embed_dim)
+        else:
+            self.layernorm_embedding = None
+
+        self.attention_span = args.encoder_attention_span
+
+    def build_encoder_layer(self, args, attn_type, n_heads):
+        return CtronnEncoderLayer(args, attn_type, n_heads)
+
+    def forward_embedding(self, src_tokens):
+        # embed tokens and positions
+        x = embed = self.embed_scale * self.embed_tokens(src_tokens)
+        if self.embed_positions is not None:
+            x = embed + self.embed_positions(src_tokens)
+        if self.layernorm_embedding is not None:
+            x = self.layernorm_embedding(x)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        return x, embed
+
+    def forward(self, src_tokens, src_lengths, return_all_hiddens: bool = False):
+        """
+        Args:
+            src_tokens (LongTensor): tokens in the source language of shape
+                `(batch, src_len)`
+            src_lengths (torch.LongTensor): lengths of each source sentence of
+                shape `(batch)`
+            return_all_hiddens (bool, optional): also return all of the
+                intermediate hidden states (default: False).
+
+        Returns:
+            namedtuple:
+                - **encoder_out** (Tensor): the last encoder layer's output of
+                  shape `(src_len, batch, embed_dim)`
+                - **encoder_padding_mask** (ByteTensor): the positions of
+                  padding elements of shape `(batch, src_len)`
+                - **encoder_embedding** (Tensor): the (scaled) embedding lookup
+                  of shape `(batch, src_len, embed_dim)`
+                - **encoder_states** (List[Tensor]): all intermediate
+                  hidden states of shape `(src_len, batch, embed_dim)`.
+                  Only populated if *return_all_hiddens* is True.
+        """
+        x, encoder_embedding = self.forward_embedding(src_tokens)
+
+        # B x T x C -> T x B x C
+        x = x.transpose(0, 1)
+
+        # compute padding mask
+        encoder_padding_mask = src_tokens.eq(self.padding_idx)
+
+        encoder_states = [] if return_all_hiddens else None
+
+        # encoder layers
+        for i, layer in enumerate(self.layers):
+            #print('layer ', i)
+            x = layer(x, encoder_padding_mask)
+            if return_all_hiddens:
+                assert encoder_states is not None
+                encoder_states.append(x)
+
+        x = x.masked_fill(encoder_padding_mask.permute(1, 0).unsqueeze(-1), 0)
+
+        if self.layer_norm is not None:
+            x = self.layer_norm(x)
+
+        return EncoderOut(
+            encoder_out=x,  # T x B x C
+            encoder_padding_mask=encoder_padding_mask,  # B x T
+            encoder_embedding=encoder_embedding,  # B x T x C
+            encoder_states=encoder_states,  # List[T x B x C]
+            src_tokens=None,
+            src_lengths=None,
+        )
+
+    def reorder_encoder_out(self, encoder_out: EncoderOut, new_order):
+        """
+        Reorder encoder output according to *new_order*.
+
+        Args:
+            encoder_out: output from the ``forward()`` method
+            new_order (LongTensor): desired order
+
+        Returns:
+            *encoder_out* rearranged according to *new_order*
+        """
+        """
+        Since encoder_padding_mask and encoder_embedding are both of type
+        Optional[Tensor] in EncoderOut, they need to be copied as local
+        variables for Torchscript Optional refinement
+        """
+        encoder_padding_mask: Optional[Tensor] = encoder_out.encoder_padding_mask
+        encoder_embedding: Optional[Tensor] = encoder_out.encoder_embedding
+
+        new_encoder_out = (
+            encoder_out.encoder_out
+            if encoder_out.encoder_out is None
+            else encoder_out.encoder_out.index_select(1, new_order)
+        )
+        new_encoder_padding_mask = (
+            encoder_padding_mask
+            if encoder_padding_mask is None
+            else encoder_padding_mask.index_select(0, new_order)
+        )
+        new_encoder_embedding = (
+            encoder_embedding
+            if encoder_embedding is None
+            else encoder_embedding.index_select(0, new_order)
+        )
+        src_tokens = encoder_out.src_tokens
+        if src_tokens is not None:
+            src_tokens = src_tokens.index_select(0, new_order)
+
+        src_lengths = encoder_out.src_lengths
+        if src_lengths is not None:
+            src_lengths = src_lengths.index_select(0, new_order)
+
+        encoder_states = encoder_out.encoder_states
+        if encoder_states is not None:
+            for idx, state in enumerate(encoder_states):
+                encoder_states[idx] = state.index_select(1, new_order)
+
+        return EncoderOut(
+            encoder_out=new_encoder_out,  # T x B x C
+            encoder_padding_mask=new_encoder_padding_mask,  # B x T
+            encoder_embedding=new_encoder_embedding,  # B x T x C
+            encoder_states=encoder_states,  # List[T x B x C]
+            src_tokens=src_tokens,  # B x T
+            src_lengths=src_lengths,  # B x 1
+        )
+
+    def max_positions(self):
+        """Maximum input length supported by the encoder."""
+        if self.embed_positions is None:
+            return self.max_source_positions
+        return min(self.max_source_positions, self.embed_positions.max_positions)
+
+    def upgrade_state_dict_named(self, state_dict, name):
+        return state_dict
+
+
+class CtronnDecoder(FairseqIncrementalDecoder):
+    """
+    Transformer decoder consisting of *args.decoder_layers* layers. Each layer
+    is a :class:`TransformerDecoderLayer`.
+
+    Args:
+        args (argparse.Namespace): parsed command-line arguments
+        dictionary (~fairseq.data.Dictionary): decoding dictionary
+        embed_tokens (torch.nn.Embedding): output embedding
+    """
+
+    def __init__(self, args, dictionary, embed_tokens):
+        self.args = args
+        super().__init__(dictionary)
+        self.register_buffer("version", torch.Tensor([3]))
+        self._future_mask = torch.empty(0)
+
+        self.dropout = args.dropout
+
+        input_embed_dim = embed_tokens.embedding_dim
+        embed_dim = args.decoder_embed_dim
+        self.embed_dim = embed_dim
+        self.output_embed_dim = args.decoder_output_dim
+
+        self.padding_idx = embed_tokens.padding_idx
+        self.max_target_positions = args.max_target_positions
+
+        self.embed_tokens = embed_tokens
+
+        self.embed_scale = 1.0 if args.no_scale_embedding else math.sqrt(embed_dim)
+
+        self.project_in_dim = (
+            Linear(input_embed_dim, embed_dim, bias=False)
+            if embed_dim != input_embed_dim
+            else None
+        )
+
+        self.embed_positions = (
+            PositionalEmbedding(
+                args.max_target_positions,
+                embed_dim,
+                self.padding_idx,
+                learned=args.decoder_learned_pos,
+            )
+            if not args.no_token_positional_embeddings
+            else None
+        )
+
+        if getattr(args, "layernorm_embedding", False):
+            self.layernorm_embedding = LayerNorm(embed_dim)
+        else:
+            self.layernorm_embedding = None
+
+        n_heads = args.decoder_self_attention_heads.split(',')
+        if len(n_heads) == 1:
+            n_heads = n_heads * args.decoder_layers
+        n_heads = [int(n) for n in n_heads]
+
+
+        self.layers = nn.ModuleList([])
+        self.layers.extend(
+            [
+                self.build_decoder_layer(n_heads[i], args) for i in range(args.decoder_layers)
+            ]
+        )
+        self.num_layers = len(self.layers)
+        self.layer_norm = None
+
+        self.project_out_dim = (
+            Linear(embed_dim, self.output_embed_dim, bias=False)
+            if embed_dim != self.output_embed_dim
+            else None
+        )
+
+        self.output_projection = None
+        self.output_projection = nn.Linear(
+            self.output_embed_dim, len(dictionary), bias=False
+        )
+        nn.init.normal_(
+            self.output_projection.weight, mean=0, std=self.output_embed_dim ** -0.5
+        )
+
+    def build_decoder_layer(self, n_head, args):
+        return CtronnDecoderLayer(n_head, args)
+
+    def forward(
+        self,
+        prev_output_tokens,
+        encoder_out: Optional[EncoderOut] = None,
+        incremental_state: Optional[Dict[str, Dict[str, Optional[Tensor]]]] = None,
+        src_lengths: Optional[Any] = None,
+        return_all_hiddens: bool = False,
+    ):
+
+        positions = (
+            self.embed_positions(prev_output_tokens)
+            if self.embed_positions is not None
+            else None
+        )
+
+        # embed tokens and positions
+        x = self.embed_scale * self.embed_tokens(prev_output_tokens)
+
+        if self.project_in_dim is not None:
+            x = self.project_in_dim(x)
+
+        if positions is not None:
+            x += positions
+
+        if self.layernorm_embedding is not None:
+            x = self.layernorm_embedding(x)
+
+        x = F.dropout(x, p=self.dropout, training=self.training)
+
+        # B x T x C -> T x B x C
+        x = x.transpose(0, 1)
+
+        self_attn_padding_mask: Optional[Tensor] = None
+        if prev_output_tokens.eq(self.padding_idx).any():
+            self_attn_padding_mask = prev_output_tokens.eq(self.padding_idx)
+
+        inner_states: List[Optional[Tensor]] = [x]
+
+        for idx, layer in enumerate(self.layers):
+            self_attn_mask = self.buffered_future_mask(x)
+            x, layer_attn, _ = layer(
+                x,
+                encoder_out.encoder_out if encoder_out is not None else None,
+                encoder_out.encoder_padding_mask if encoder_out is not None else None,
+                incremental_state=None,
+                self_attn_mask=self_attn_mask,
+                self_attn_padding_mask=self_attn_padding_mask
+            )
+            inner_states.append(x)
+
+        if self.layer_norm is not None:
+            x = self.layer_norm(x)
+
+        # T x B x C -> B x T x C
+        x = x.transpose(0, 1)
+
+        if self.project_out_dim is not None:
+            x = self.project_out_dim(x)
+
+        x = self.output_projection(x)
+        return x, {"attn": None, "inner_states": inner_states}
+
+
+    def max_positions(self):
+        """Maximum output length supported by the decoder."""
+        if self.embed_positions is None:
+            return self.max_target_positions
+        return min(self.max_target_positions, self.embed_positions.max_positions)
+
+    def buffered_future_mask(self, tensor):
+        dim = tensor.size(0)
+        # self._future_mask.device != tensor.device is not working in TorchScript. This is a workaround.
+        if self._future_mask.size(0) < dim:
+            self._future_mask = torch.triu(
+                #utils.fill_with_neg_inf(torch.zeros([dim, dim])), 1
+                torch.ones([dim, dim]), 1
+            ).to(torch.bool)
+        self._future_mask = self._future_mask.to(tensor.device)
+
+        return self._future_mask[:dim, :dim]
+
+    def upgrade_state_dict_named(self, state_dict, name):
+        return state_dict
+
+
+def Embedding(num_embeddings, embedding_dim, padding_idx):
+    m = nn.Embedding(num_embeddings, embedding_dim, padding_idx=padding_idx)
+    nn.init.normal_(m.weight, mean=0, std=embedding_dim ** -0.5)
+    nn.init.constant_(m.weight[padding_idx], 0)
+    return m
+
+
+def Linear(in_features, out_features, bias=True):
+    m = nn.Linear(in_features, out_features, bias)
+    nn.init.xavier_uniform_(m.weight)
+    if bias:
+        nn.init.constant_(m.bias, 0.0)
+    return m
+
+@register_model_architecture("ctronn", "ctronn")
+def base_architecture(args):
+    args.encoder_embed_path = getattr(args, "encoder_embed_path", None)
+    args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 64)
+    args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 256)
+    args.encoder_layers = getattr(args, "encoder_layers", 4)
+    args.encoder_attention_heads = getattr(args, "encoder_attention_heads", '8')
+    args.encoder_learned_pos = getattr(args, "encoder_learned_pos", False)
+    args.decoder_embed_path = getattr(args, "decoder_embed_path", None)
+    args.decoder_embed_dim = getattr(args, "decoder_embed_dim", 64)
+    args.decoder_ffn_embed_dim = getattr(
+        args, "decoder_ffn_embed_dim", 256
+    )
+    args.decoder_layers = getattr(args, "decoder_layers", 4)
+    args.decoder_attention_heads = getattr(args, "decoder_attention_heads", 8)
+    args.decoder_self_attention_heads = getattr(args, "decoder_self_attention_heads", '8')
+    args.decoder_learned_pos = getattr(args, "decoder_learned_pos", False)
+    args.attention_dropout = getattr(args, "attention_dropout", 0.0)
+    args.activation_dropout = getattr(args, "activation_dropout", 0.0)
+    args.activation_fn = getattr(args, "activation_fn", "relu")
+    args.dropout = getattr(args, "dropout", 0.1)
+    args.no_token_positional_embeddings = getattr(
+        args, "no_token_positional_embeddings", False
+    )
+
+    args.decoder_output_dim = getattr(
+        args, "decoder_output_dim", args.decoder_embed_dim
+    )
+    args.decoder_input_dim = getattr(args, "decoder_input_dim", args.decoder_embed_dim)
+
+    args.no_scale_embedding = getattr(args, "no_scale_embedding", False)
+    args.layernorm_embedding = getattr(args, "layernorm_embedding", False)
